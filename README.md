@@ -3,6 +3,19 @@
 Gagent 是一个运行在 Windows 终端里的本地 Agent。它提供连续对话、多会话切换、网页搜索、
 PDF/Excel 读取、Python 计算，以及跨会话使用的文件 RAG 长期记忆。
 
+## 技术栈
+
+- **Python 3.11**：核心运行环境、CLI 和后台任务。
+- **LangGraph + LangChain**：Agent 状态流转、工具调用循环和消息管理。
+- **OpenAI-compatible API**：通过 `ChatOpenAI` 接入兼容 OpenAI 协议的模型服务。
+- **FastAPI + Uvicorn + HTTPX**：独立文件服务、后台入库任务和 CLI/服务通信。
+- **ChromaDB**：持久化保存 PDF 片段与 Excel 摘要向量。
+- **Sentence Transformers + multilingual-e5-small**：中英文文本 embedding 和语义检索。
+- **SQLite**：保存文件版本、入库任务、重试状态和事件记录。
+- **pypdf + pandas/openpyxl**：PDF 文本提取、Excel 预览和数据处理。
+- **Beautiful Soup + DDGS**：网页解析和网络搜索。
+- **unittest**：Agent、CLI 与 RAG 服务的自动化测试。
+
 ## 使用
 
 在 `api.py` 中配置模型接口（该文件不会提交到 Git）：

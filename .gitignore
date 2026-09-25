@@ -1,0 +1,7 @@
+api.py
+rag_data/
+downloads/
+logs/
+sessions/
+__pycache__/
+*.py[cod]

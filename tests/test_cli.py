@@ -151,7 +151,7 @@ class TestStartup(CliHarness):
 class TestCommands(CliHarness):
     def test_help_lists_every_command_and_the_memory_rules(self):
         _code, text, _chat, _fake = self.drive(["/help", "/exit"])
-        for token in ("/help", "/new [标题]", "/sessions", "/switch <id>", "/exit"):
+        for token in ("/help", "/api", "/new [标题]", "/sessions", "/switch <id>", "/exit"):
             self.assertIn(token, text)
         self.assertIn("同一个会话保留上下文", text)
         self.assertIn("/new 创建独立会话", text)

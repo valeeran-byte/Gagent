@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import threading
 
-import G_agent
+from api_setup import ensure_api_config, prompt_api_settings, save_active_api_settings
 from rag import client as rag_client
 from session_store import (SESSIONS_DIR, UNTITLED_TITLE, SessionCorrupted, SessionNotFound,
                            SessionStore, clean_title)
@@ -33,6 +33,7 @@ TOOL_LABELS = {
 }
 HELP_TEXT = """命令：
   /help             显示本帮助
+  /api              输入并切换模型接口
   /new [标题]       创建并进入一个新的空会话；不写标题时用第一个提问作会话名
   /sessions         列出已保存的会话，* 表示当前会话
   /switch           列出会话供选择，输入编号进入
@@ -256,6 +257,11 @@ class Chat:
             return False
         if name == "help":
             self.line(HELP_TEXT)
+        elif name == "api":
+            if argument:
+                self.line("用法：/api")
+            else:
+                self.switch_api()
         elif name == "new":
             self.new_session(argument)
         elif name == "sessions":
@@ -315,6 +321,25 @@ class Chat:
         self.line(f"已提交重试：新任务 {result['job_id']}（第 {result['round']} 轮，最多 3 次尝试）")
 
     # ---------- 命令 ----------
+
+    def switch_api(self) -> None:
+        self.line("请输入新的模型接口配置：")
+        try:
+            settings = prompt_api_settings()
+            import G_agent
+            agent = G_agent.BasicAgent(api_settings=settings)
+            save_active_api_settings(settings)
+        except (KeyboardInterrupt, EOFError):
+            self.line("\n已取消，当前模型接口不变。")
+            return
+        except OSError as exc:
+            self.say(f"保存模型接口失败：{exc}。当前配置不变。")
+            return
+        except Exception as exc:
+            self.say(f"切换模型接口失败：{type(exc).__name__}。当前配置不变。")
+            return
+        self.agent = agent
+        self.line(f"已切换模型接口：{settings['MODEL']} ({settings['BASE_URL']})")
 
     def new_session(self, title: str) -> None:
         try:
@@ -485,8 +510,19 @@ def main(argv=None, *, store: SessionStore | None = None, agent=None, out=None,
                         help="会话目录，默认项目下的 sessions/")
     args = parser.parse_args(argv)
     _ensure_utf8_output()
+    if agent is None:
+        try:
+            ensure_api_config()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAPI 配置已取消，未保存。", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"API 配置保存失败：{exc}", file=sys.stderr)
+            return 1
+        import G_agent
+        agent = G_agent.BasicAgent()
     chat = Chat(store or SessionStore(Path(args.sessions_dir)),
-                agent if agent is not None else G_agent.BasicAgent(),
+                agent,
                 out=out or sys.stdout, input_fn=input_fn, notifier=notifier)
     return chat.start()
 

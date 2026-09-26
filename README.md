@@ -18,7 +18,8 @@ PDF/Excel 读取、Python 计算，以及跨会话使用的文件 RAG 长期记�
 
 ## 使用
 
-在 `api.py` 中配置模型接口（该文件不会提交到 Git）：
+首次启动会询问 API Key、Model 和 Base URL，并保存到 `api.py`（该文件不会提交到 Git）。
+如果已经有 `api.py`，首次配置会跳过且不会覆盖它；使用 `/api` 切换后，启动时优先使用新选择。`api.py` 格式为：
 
 ```python
 API_KEY = "你的 API Key"
@@ -26,16 +27,19 @@ BASE_URL = "模型接口地址"
 MODEL = "模型名称"
 ```
 
-安装项目依赖后，在终端输入：
+在终端输入（首次运行会自动在项目目录创建 `.venv` 并安装 `requirements.txt`）：
 
 ```powershell
 Gagent
 ```
 
+进入 CLI 后输入 `/api` 可以重新录入并切换模型接口；新选择保存在本地的 `api_active.json`，下次启动继续使用。
+
 进入 CLI 后可以直接提问，也可以使用以下命令：
 
 ```text
 /help             查看帮助
+/api              切换模型接口
 /new [标题]       新建会话
 /sessions         查看所有会话
 /switch <id>      切换会话

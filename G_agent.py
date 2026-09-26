@@ -18,7 +18,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-import api
+from api_setup import active_api_settings
 from rag import client as rag_client
 from agent_tools import (
     TOOLS, _tool_error, tool_session, web_search, visit_webpage, read_html,
@@ -386,11 +386,12 @@ def _round_input(prompt: str, results: list[dict]) -> str:
 
 
 class BasicAgent:
-    def __init__(self):
+    def __init__(self, api_settings: dict[str, str] | None = None):
+        settings = active_api_settings() if api_settings is None else api_settings
         llm = ChatOpenAI(
-            api_key=api.API_KEY,
-            model = api.MODEL,
-            base_url = api.BASE_URL,
+            api_key=settings["API_KEY"],
+            model=settings["MODEL"],
+            base_url=settings["BASE_URL"],
             temperature=0,
             timeout=45,
             max_retries=1,

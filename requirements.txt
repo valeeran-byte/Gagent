@@ -1,0 +1,23 @@
+# CLI, model calls, and web tools
+beautifulsoup4
+ddgs
+httpx
+langchain-core
+langchain-openai
+langgraph
+
+# Local PDF/Excel reading and file service
+fastapi
+openpyxl
+pandas
+pyxlsb
+pydantic
+pypdf
+uvicorn
+xlrd
+
+# Persistent vector memory and local embeddings
+chromadb
+huggingface-hub
+numpy
+sentence-transformers

@@ -34,13 +34,14 @@ from rag import service as file_service
 from rag import storage as file_storage
 from rag import state as rag_state
 from rag import vectors as rag_store
+import session_store
 
 
 MODEL_TOKENS = re.compile(r"\w+|[^\w\s]")
 
 # 所有临时资料目录集中在一个父目录下：Chroma 的全局实例缓存会让句柄迟迟不释放，
 # 逐个删不干净；改成每次运行开头整体清空这一个父目录，垃圾不会越攒越多。
-SCRATCH = pathlib.Path(tempfile.gettempdir()) / "gagent_rag_tests"
+SCRATCH = pathlib.Path(tempfile.gettempdir()) / f"gagent_rag_tests_{os.getpid()}"
 shutil.rmtree(SCRATCH, ignore_errors=True)
 
 
@@ -108,15 +109,23 @@ class FakeModel:
 
 
 class TempRoot:
-    """把资料目录挪到项目外的临时目录；模型仍在项目里，不重复下载。"""
+    """把资料目录挪到项目外的临时目录；模型仍在项目里，不重复下载。
+
+    会话目录一起隔离：服务启动时会把已有 session 补进对话索引，若不隔离就会读到
+    项目真实的 sessions/，把 conversation_indexed 事件混进本用例的事件断言里。
+    """
 
     def setUp(self):
         self.root = SCRATCH / f"t_{uuid_hex()}"
         self.patch = patch.object(rag_state, "DATA_ROOT", self.root)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        sessions = patch.object(session_store, "SESSIONS_DIR", self.root / "sessions")
+        sessions.start()
+        self.addCleanup(sessions.stop)
         self.addCleanup(self.wipe)
         rag_state.ensure_dirs()
+        (self.root / "sessions").mkdir(parents=True, exist_ok=True)
 
     def wipe(self) -> None:
         """能删就删；删不动的留给下次运行开头统一清掉，不为句柄释放去睡眠等待。"""
@@ -217,6 +226,8 @@ class TestReadEndpoints(ServiceCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["protocol"], rag_state.PROTOCOL)
         self.assertEqual(body["service_id"], rag_state.service_id())
+        self.assertEqual(body["sessions_dir"], str(self.root / "sessions"),
+                         "服务要上报自己用的会话目录，客户端据此拒绝目录不一致的实例")
         self.assertTrue(body["ok"])
 
     def test_read_pdf_returns_content_and_queued_job(self):
@@ -322,8 +333,9 @@ class TestIngestionJobs(ServiceCase):
         self.assertEqual(job["attempts"], 1, "无可提取文字是确定性问题，不该重跑")
         self.assertIn("OCR", job["last_error"])
         events = [(row["kind"], row["message"]) for row in self.get("/v1/events")[1]["events"]]
-        self.assertEqual(events[0][0], "failed")
-        self.assertIn("已停止自动重试", events[0][1])
+        failed = [item for item in events if item[0] == "failed"]
+        self.assertTrue(failed, f"没有失败事件：{events}")
+        self.assertIn("已停止自动重试", failed[0][1])
 
     def test_retry_is_capped_at_three_attempts_surviving_restart(self):
         self.fast_retries()
@@ -720,7 +732,8 @@ class TestServiceDiscovery(RagEnabled, TempRoot, unittest.TestCase):
 
     def write_info(self, **overrides) -> dict:
         info = {"port": 4599, "pid": 1234, "protocol": rag_state.PROTOCOL,
-                "service_id": rag_state.service_id(), "started_at": "now"}
+                "service_id": rag_state.service_id(), "started_at": "now",
+                "sessions_dir": str(session_store.SESSIONS_DIR)}
         info.update(overrides)
         rag_state.service_info_path().write_text(json.dumps(info), encoding="utf-8")
         return info
@@ -753,6 +766,36 @@ class TestServiceDiscovery(RagEnabled, TempRoot, unittest.TestCase):
             with patch.object(client.httpx, "get", return_value=Reply(
                     {"ok": True, "protocol": rag_state.PROTOCOL, "service_id": info["service_id"]})):
                 self.assertEqual(client.running()["port"], 4599)
+
+    def test_a_live_service_with_another_sessions_dir_is_refused(self):
+        """服务在跑但会话目录不是本次要用的：不复用，也不再起一个。"""
+        other = str(self.root / "other-sessions")
+        info = self.write_info(sessions_dir=other)
+
+        class Reply:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        health = {"ok": True, "protocol": rag_state.PROTOCOL, "service_id": info["service_id"],
+                  "pid": info["pid"], "sessions_dir": other}
+        client._invalidate()  # 去掉别的用例可能留下的地址缓存
+        with patch.object(client, "service_info", return_value=info), \
+                patch.object(client.httpx, "get", return_value=Reply(health)), \
+                patch.object(client, "_spawn") as spawner:
+            self.assertIsNone(client.running(), "会话目录不一致的服务不能被复用")
+            self.assertIsNotNone(client.foreign_service(), "必须能把这种旧实例认出来")
+            with self.assertRaises(client.ServiceUnavailable) as caught:
+                client.endpoint()
+            with self.assertRaises(client.ServiceUnavailable):
+                client.endpoint(False)
+            spawner.assert_not_called()  # 再起一个会让两个进程同时写同一份数据
+        message = str(caught.exception)
+        self.assertIn(other, message, "要说清旧服务的会话目录")
+        self.assertIn(str(session_store.SESSIONS_DIR), message, "要说清本次运行的会话目录")
+        self.assertIn("taskkill", message, "要给出可执行的恢复办法")
 
     def test_endpoint_does_not_start_service_for_polling(self):
         with patch.object(client, "running", return_value=None):
@@ -825,7 +868,7 @@ class TestDetachedLifecycle(RagEnabled, TempRoot, unittest.TestCase):
 
         return Handler
 
-    def run_client(self, code: str) -> str:
+    def run_client(self, code: str, **env) -> str:
         script = f"""
 import json, os, sys
 sys.path.insert(0, {json.dumps(str(pathlib.Path(__file__).resolve().parents[1]))})
@@ -834,9 +877,51 @@ from rag import client
 {code}
 """
         result = subprocess.run([sys.executable, "-X", "utf8", "-c", script], capture_output=True,
-                                timeout=180, cwd=str(pathlib.Path(__file__).resolve().parents[1]))
+                                timeout=180, cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+                                env={**os.environ, **env})
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         return result.stdout.decode("utf-8", "replace")
+
+    def test_a_running_service_with_another_sessions_dir_is_never_reused(self):
+        """先按 A 目录起服务（CLI 退出后它继续跑），再用 B 目录运行：拒绝复用且不再起一个。"""
+        first, second = self.root / "sessions-first", self.root / "sessions-second"
+        first.mkdir(parents=True, exist_ok=True)
+        second.mkdir(parents=True, exist_ok=True)
+
+        started = json.loads(self.run_client("""
+client.endpoint()  # 等它真起来
+info = client.health()
+print(json.dumps({"pid": info["pid"], "sessions_dir": info["sessions_dir"]}))
+""", GAGENT_SESSIONS_DIR=str(first)).strip().splitlines()[-1])
+        self.assertEqual(started["sessions_dir"], str(first))
+        on_disk = json.loads(rag_state.service_info_path().read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["sessions_dir"], str(first), "service.json 也要写明会话目录")
+
+        refused = json.loads(self.run_client("""
+from unittest.mock import patch
+spawned = []
+def refuse_to_spawn():
+    spawned.append(True)
+    raise AssertionError("会话目录不一致时不允许再起一个服务")
+with patch.object(client, "_spawn", side_effect=refuse_to_spawn):
+    try:
+        client.endpoint()
+        outcome = {"error": None, "spawned": list(spawned)}
+    except client.ServiceUnavailable as exc:
+        outcome = {"error": str(exc), "spawned": list(spawned)}
+print(json.dumps(outcome, ensure_ascii=False))
+""", GAGENT_SESSIONS_DIR=str(second)).strip().splitlines()[-1])
+        self.assertTrue(refused["error"], "目录不一致时必须明确拒绝，而不是连到旧服务")
+        self.assertIn(str(second), refused["error"])
+        self.assertIn(str(first), refused["error"])
+        self.assertEqual(refused["spawned"], [], "不能在旧服务之外再起一个写同一份数据")
+
+        after = json.loads(self.run_client("""
+info = client.health()
+print(json.dumps({"pid": info["pid"], "sessions_dir": info["sessions_dir"]}))
+""", GAGENT_SESSIONS_DIR=str(first)).strip().splitlines()[-1])
+        self.assertEqual(after["pid"], started["pid"], "原服务没有被替换")
+        self.assertEqual(after["sessions_dir"], str(first))
 
     def test_service_keeps_working_after_client_exits(self):
         output = self.run_client(f"""
@@ -859,8 +944,10 @@ print(json.dumps(client.job("{job_id}")["status"]))
         events = json.loads(self.run_client("""
 print(json.dumps([[e["kind"], e["message"]] for e in client.events_after(0)["events"]]))
 """).strip().splitlines()[-1])
-        self.assertEqual(events[-1][0], "indexed")
-        self.assertIn("已加入长期记忆", events[-1][1])
+        # 按事件类型筛：服务启动时可能同时补建对话索引，事件顺序不保证
+        indexed = [item for item in events if item[0] == "indexed"]
+        self.assertTrue(indexed, f"没有 indexed 事件：{events}")
+        self.assertIn("已加入长期记忆", indexed[-1][1])
         hits = json.loads(self.run_client("""
 print(json.dumps([[h["kind"], h.get("page"), round(h["score"], 3)]
                   for h in client.search("happiness report annex")["results"]]))

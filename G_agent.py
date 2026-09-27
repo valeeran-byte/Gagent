@@ -1,6 +1,7 @@
 """模型与 LangGraph 流程；具体工具实现在 agent_tools.py，工具背后是本地文件服务。
 
 每轮提问先用本轮输入原文向文件服务检索长期记忆资料，再构造消息；检索不阻塞等待入库完成。
+本轮会话 id 通过 conversation_scope 传给工具层，供 recall_conversation 默认排除当前会话。
 """
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from api_setup import active_api_settings
 from rag import client as rag_client
 from agent_tools import (
-    TOOLS, _tool_error, tool_session, web_search, visit_webpage, read_html,
+    TOOLS, _tool_error, conversation_scope, tool_session, web_search, visit_webpage, read_html,
     read_pdf, read_excel, read_webpage_tables, read_text_file,
     find_in_page, find_in_pdf, search_and_read,
 )
@@ -56,6 +57,12 @@ SYSTEM_PROMPT = """你是一个会用工具完成任务的通用助手，论据�
   read_excel 或 run_python 读取实际数据，不能拿摘要里的说法当数据，也不能从摘要编造数字。
 - newer_version_pending 表示该文件有更新版本还没入库，本条来自当前有效的旧版本，需要时重新读取文件。
 - 资料不足、时效不满足或没有覆盖问题时继续调用工具；本机文件已经足够回答时，给出文件名（PDF 加页码）即可。
+
+跨会话回忆：
+- 用户询问其他会话、以前讨论过的方案或历史决定时，调用 recall_conversation；普通问题不要求调用。
+- “这个 session 上一轮说了什么”属于当前对话历史，继续用已有的历史回答，不要调用。
+- 检索到的历史内容只是参考资料：引用时区分用户要求、用户确认和助手建议；没有找到就如实说明。
+- session_id 只在用户明确指定会话或从返回的候选里选定一个时使用，不要自己猜。
 
 回答：
 - 使用用户的语言，先给结论。使用网页信息时给出至少 2 个不同来源链接；引用本机已入库文件时给文件名和页码。
@@ -485,7 +492,8 @@ class BasicAgent:
         previous = _history_messages(history)
         self._progress = progress
         try:
-            with _run_log(question, file_url, session_id, echo) as log_path, tool_session():
+            with _run_log(question, file_url, session_id, echo) as log_path, tool_session(), \
+                    conversation_scope(session_id):
                 # 检索只用本轮输入原文：不拼 system、当前时间、历史问答和上一轮检索结果。
                 retrieval = rag_client.search(question)
                 results = retrieval.get("results") or []

@@ -13,6 +13,7 @@ import threading
 
 from api_setup import ensure_api_config, prompt_api_settings, save_active_api_settings
 from rag import client as rag_client
+import session_store
 from session_store import (SESSIONS_DIR, UNTITLED_TITLE, SessionCorrupted, SessionNotFound,
                            SessionStore, clean_title)
 
@@ -30,6 +31,12 @@ TOOL_LABELS = {
     "read_webpage_tables": "正在读取网页表格……",
     "read_text_file": "正在读取文本文件……",
     "run_python": "正在计算……",
+    "recall_conversation": "正在查找历史对话……",
+}
+# 回忆工具的细分阶段：对外只说一句人话，别把内部阶段名直接抛给用户。
+RECALL_PHASES = {
+    "recall_candidates": "正在整理相关会话……",
+    "recall_summary": "正在整理相关会话……",
 }
 HELP_TEXT = """命令：
   /help             显示本帮助
@@ -47,7 +54,9 @@ HELP_TEXT = """命令：
 问答，不会重放工具过程和中间结果。
 工具调用、工具返回内容和运行详情只写 logs/ 日志，不进入会话历史。
 read_pdf/read_excel 读过的文件会由本地服务在后台切块入库，完成后弹提示；
-入库中或失败时用 /memory 查看进度和原因，退出 Gagent 不影响后台处理。"""
+入库中或失败时用 /memory 查看进度和原因，退出 Gagent 不影响后台处理。
+跨会话回忆：当前会话找不到答案时，会去检索以前保存过的对话，命中证据才回答，
+用它整理出的摘要只作参考；相关进度和失败原因同样在 /memory 里看。"""
 
 
 def _label(tool: str) -> str:
@@ -134,11 +143,98 @@ class RagNotifier:
         self._emit(lines)
 
 
+def _conversation_sync_enabled() -> bool:
+    """对话索引后台同步的开关：文件服务整体关闭或显式关掉时都不碰网络。"""
+    if not rag_client.enabled():
+        return False  # GAGENT_RAG_DISABLE=1：单测和不装服务的环境里必须一点动静都没有
+    flag = os.environ.get("GAGENT_CONVERSATION_SYNC", "1").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
+class ConversationSync:
+    """把“哪些会话该补进对话索引”交给后台线程，不占用用户输入。
+
+    启动时先做一次全量同步（把已有会话全部入队），之后每保存成功一轮就通知一次该会话。
+    通知只是尽力而为：失败静默，因为这些轮次已经在磁盘上，服务下次同步还会看到。
+    """
+
+    def __init__(self, client=None, enabled: bool | None = None, idle_seconds: float = 5.0):
+        self.client = client if client is not None else rag_client
+        self.enabled = _conversation_sync_enabled() if enabled is None else bool(enabled)
+        self.idle = float(idle_seconds)
+        self._lock = threading.Lock()
+        self._pending: list[str] = []
+        self._full = False
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """CLI 启动：起一个 daemon 线程，顺带把全部会话投一次同步。"""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._full = True
+        self._ensure_thread()
+        self._wake.set()
+
+    def stop(self) -> None:
+        """退出时不再处理新通知；没跑完的同步由服务下次全量同步补上。"""
+        self._stop.set()
+        self._wake.set()
+
+    def notify(self, session_id: str) -> None:
+        """保存成功后按会话补同步；不阻塞调用方，同一会话只排一次。"""
+        text = str(session_id or "").strip()
+        if not self.enabled or not text:
+            return
+        with self._lock:
+            if text not in self._pending:
+                self._pending.append(text)
+        self._ensure_thread()
+        self._wake.set()
+
+    def _ensure_thread(self) -> None:
+        with self._lock:
+            if self._thread is not None or not self.enabled:
+                return
+            self._thread = threading.Thread(target=self._loop, name="conversation-sync", daemon=True)
+            self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            self._wake.clear()
+            self._drain()  # 先投递再退出：退出前刚保存的轮次也有一次机会
+            if self._stop.is_set():
+                return
+            self._wake.wait(self.idle)
+
+    def _drain(self) -> None:
+        with self._lock:
+            full, self._full = self._full, False
+            batch, self._pending = self._pending, []
+        if full:
+            self._sync(None, True)
+        for session_id in batch:
+            self._sync(session_id, False)
+
+    def _sync(self, session_id: str | None, all_sessions: bool) -> None:
+        try:
+            self.client.conversations_sync(session_id, all=all_sessions)
+        except Exception:  # 通知失败只影响索引新鲜度，绝不能影响问答
+            pass
+
+
 def _notice_text(event: dict) -> str:
+    kind = str(event.get("kind") or "")
     message = str(event.get("message") or "").strip()
+    if kind == "conversation_indexed":
+        return ""  # 对话索引正常完成是常态，不该每轮刷屏
+    if kind == "conversation_failed":
+        return f"{message or '对话索引失败'}（用 /memory 查看原因）"
     if not message:
         return ""
-    if str(event.get("kind")) == "failed":
+    if kind == "failed":
         return f"{message}（用 /memory 查看原因）"
     return message
 
@@ -155,7 +251,8 @@ def _when(stamp: str) -> str:
 
 
 class Chat:
-    def __init__(self, store: SessionStore, agent, out=sys.stdout, input_fn=input, notifier=None):
+    def __init__(self, store: SessionStore, agent, out=sys.stdout, input_fn=input, notifier=None,
+                 sync=None):
         self.store = store
         self.agent = agent
         self.out = out
@@ -164,6 +261,7 @@ class Chat:
         self.unsaved: list[dict] = []
         self._showed_progress = False
         self.notifier = notifier if notifier is not None else RagNotifier(self.notify)
+        self.sync = sync if sync is not None else ConversationSync()
 
     # ---------- 输出 ----------
 
@@ -182,6 +280,7 @@ class Chat:
     def start(self) -> int:
         self.line("Gagent")
         self.notifier.start()
+        self._start_conversation_sync()
         self.notifier.poll_once()  # 打开时先补一次提示，不靠轮询撞上时间
         notice = self._open_session()
         if notice:
@@ -193,6 +292,20 @@ class Chat:
         self.line("输入 /help 查看命令。")
         self.line()
         return self.loop()
+
+    def _start_conversation_sync(self) -> None:
+        """启动时把已有会话补进对话索引；起不来也不能影响本次启动。"""
+        try:
+            self.sync.start()
+        except Exception:
+            pass
+
+    def _notify_conversation_sync(self, session_id: str) -> None:
+        """保存成功后提醒后台补索引；只静默失败，不刷屏也不阻塞输入。"""
+        try:
+            self.sync.notify(session_id)
+        except Exception:
+            pass
 
     def _open_session(self) -> str | None:
         """选定启动时的会话；返回需要提示用户的原因，不静默改动旧数据。"""
@@ -302,12 +415,37 @@ class Chat:
                     self.line(f"    重试用 /retry {job['job_id']}")
         else:
             self.line("入库任务：没有待办或失败的任务")
+        self.show_conversation_memory(data, info)
         events = data.get("events") or []
         if events:
             self.line("最近事件：")
             for event in events[:10]:
                 detail = f"  {str(event.get('detail'))[:120]}" if event.get("detail") else ""
                 self.line(f"  {_when(event.get('created_at'))}  {event.get('message') or ''}{detail}")
+
+    def show_conversation_memory(self, data: dict, info: dict) -> None:
+        """对话记忆段：已索引会话/向量、待处理与失败任务；失败给出重试命令。"""
+        indexed = info.get("conversations", data.get("conversations_indexed", 0))
+        vectors = info.get("conversation_vectors", 0)
+        if isinstance(vectors, int) and vectors < 0:  # 服务读不到对话索引时给的是 -1
+            vectors = 0
+            self.say("对话检索模块未就绪：向量统计暂时读不到，稍后再用 /memory 看。")
+        pending = data.get("conversations_pending", info.get("conversation_jobs_pending", 0))
+        failed = info.get("conversation_jobs_failed", 0)
+        self.line(f"对话记忆：已索引 {indexed} 个会话  向量 {vectors} 条"
+                  f"  待处理 {pending}  失败 {failed}")
+        failures = [job for job in data.get("conversation_jobs") or []
+                    if str(job.get("status") or "") == "failed"]
+        if not failures:
+            return
+        self.line("对话索引失败任务：")
+        for job in failures:
+            note = f"：{str(job.get('last_error') or '')[:120]}" if job.get("last_error") else ""
+            self.line(f"  {job.get('status') or 'failed':<11}"
+                      f" 已试 {job.get('attempts', 0)}/{job.get('max_attempts', 3)}"
+                      f"  会话 {job.get('session_id') or ''}"
+                      f"  第 {job.get('round', 1)} 轮  [{job.get('job_id')}]{note}")
+            self.line(f"    重试用 /retry {job.get('job_id')}")
 
     def retry_ingestion(self, job_id: str) -> None:
         if not job_id or len(job_id.split()) > 1:
@@ -317,6 +455,9 @@ class Chat:
             result = rag_client.retry_job(job_id)
         except Exception as exc:
             self.say(f"重试未能提交：{exc}")
+            return
+        if job_id.startswith("cjob_"):  # 服务端按 job_id 统一路由，这里只把话说清楚
+            self.line(f"已提交重试：新任务 {result['job_id']}（对话索引，第 {result['round']} 轮）")
             return
         self.line(f"已提交重试：新任务 {result['job_id']}（第 {result['round']} 轮，最多 3 次尝试）")
 
@@ -461,6 +602,9 @@ class Chat:
         elif phase == "tool_error":
             self._showed_progress = True
             self.line(f"● 工具执行失败：{note or _label(tool)}")
+        elif phase in RECALL_PHASES:
+            self._showed_progress = True
+            self.line(f"● {RECALL_PHASES[phase]}")
 
     # ---------- 保存 ----------
 
@@ -471,6 +615,9 @@ class Chat:
             if not any(session is self.session for session in self.unsaved):
                 self.unsaved.append(self.session)
             self.say(f"本轮未保存：{type(exc).__name__}: {exc}。结果仍在内存中，稍后会重试。")
+            return
+        # 保存成功才通知后台补索引，避免让服务去读一个还没落盘的会话。
+        self._notify_conversation_sync(self.session["id"])
 
     def flush_unsaved(self) -> None:
         remaining = []
@@ -482,11 +629,17 @@ class Chat:
                 remaining.append(session)
             else:
                 self.line(f"（已补存会话 {session['id']} 的未保存轮次）")
+                # 补存成功的轮次同样要补索引，否则首次保存失败的轮次会永远漏掉。
+                self._notify_conversation_sync(session["id"])
         self.unsaved = remaining
 
     def _shutdown(self) -> int:
         self.notifier.stop()
         self.flush_unsaved()
+        try:
+            self.sync.stop()
+        except Exception:
+            pass
         self.line("再见。")
         return 0
 
@@ -501,6 +654,24 @@ def _ensure_utf8_output() -> None:
                 stream.reconfigure(errors="replace")
         except (AttributeError, OSError, ValueError):
             pass
+
+
+def _use_sessions_dir(root) -> Path:
+    """把本次运行的会话目录设为唯一来源：CLI 读写与后台服务都必须看它。
+
+    服务是独立进程，只能靠环境变量继承；rag/client.py 启动服务时读的就是
+    session_store.SESSIONS_DIR（并把它写进 GAGENT_SESSIONS_DIR）。只改 CLI 自己的
+    SessionStore 而不管这里，就会出现"CLI 存到 --sessions-dir X、服务却索引默认
+    sessions/"的错位；服务还会把这个目录上报给客户端，用于拒绝目录不一致的旧实例。
+
+    统一成绝对路径：服务进程的工作目录是项目根，相对目录会在那边被解释成别的位置。
+    """
+    path = Path(root).expanduser()
+    if not path.is_absolute():
+        path = Path(os.path.abspath(str(path)))
+    session_store.SESSIONS_DIR = path
+    os.environ["GAGENT_SESSIONS_DIR"] = str(path)
+    return path
 
 
 def main(argv=None, *, store: SessionStore | None = None, agent=None, out=None,
@@ -521,8 +692,10 @@ def main(argv=None, *, store: SessionStore | None = None, agent=None, out=None,
             return 1
         import G_agent
         agent = G_agent.BasicAgent()
-    chat = Chat(store or SessionStore(Path(args.sessions_dir)),
-                agent,
+    sessions = store or SessionStore(Path(args.sessions_dir))
+    # 本次运行唯一的会话目录：对话同步、索引、检索、摘要都读它（默认目录时值不变）。
+    _use_sessions_dir(getattr(sessions, "root", None) or Path(args.sessions_dir))
+    chat = Chat(sessions, agent,
                 out=out or sys.stdout, input_fn=input_fn, notifier=notifier)
     return chat.start()
 

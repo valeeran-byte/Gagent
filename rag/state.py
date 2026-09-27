@@ -2,6 +2,9 @@
 
 数据根目录固定在本项目下（rag_data/），不随启动终端的工作目录变化；测试通过替换
 rag_state.DATA_ROOT 隔离。这里只保存"任务与元数据"，向量本身在 Chroma（rag_store.py）。
+对话记忆用独立的 conversations / conversation_versions / conversation_jobs /
+conversation_summaries 四张表：版本以整份会话的内容指纹 revision 记账，任务调度与
+重试口径和文件任务完全一致，但不强行复用文件的 doc_id/version_id 字段。
 
 任务重试口径（file_service 的调度器依赖本模块保证）：
 - 一个文件版本对应一条当前任务（round 最大的那一轮），执行前先把 attempts +1 落盘；
@@ -138,6 +141,62 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS versions_doc ON versions (doc_id, sha256);
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs (status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS jobs_version ON jobs (doc_id, version_id);
+
+-- 对话记忆：会话版本、对话索引任务和摘要缓存。
+-- 对话任务不复用文件任务的 doc_id/version_id 字段：一个会话版本对应多条向量，
+-- 版本切换以整份会话内容指纹 revision 为准，而不是文件那种 sha256 单文件。
+CREATE TABLE IF NOT EXISTS conversations (
+    session_id   TEXT PRIMARY KEY,
+    title        TEXT NOT NULL,
+    turn_count   INTEGER NOT NULL DEFAULT 0,
+    active_revision TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL REFERENCES conversations (session_id),
+    revision     TEXT NOT NULL,
+    turn_count   INTEGER NOT NULL,
+    title        TEXT,
+    chunk_count  INTEGER,
+    max_tokens   INTEGER,
+    status       TEXT NOT NULL,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    indexed_at   TEXT,
+    UNIQUE (session_id, revision)
+);
+CREATE TABLE IF NOT EXISTS conversation_jobs (
+    job_id          TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES conversations (session_id),
+    version_id      INTEGER NOT NULL REFERENCES conversation_versions (id),
+    kind            TEXT NOT NULL DEFAULT 'conversation',
+    status          TEXT NOT NULL,
+    stage           TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 3,
+    round           INTEGER NOT NULL DEFAULT 1,
+    next_attempt_at REAL,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE (session_id, version_id, round)
+);
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    session_id            TEXT NOT NULL,
+    source_revision       TEXT NOT NULL,
+    summary_schema_version INTEGER NOT NULL,
+    summary_json          TEXT NOT NULL,
+    generated_at          TEXT NOT NULL,
+    PRIMARY KEY (session_id, source_revision, summary_schema_version)
+);
+CREATE INDEX IF NOT EXISTS conversation_versions_session
+    ON conversation_versions (session_id, revision);
+CREATE INDEX IF NOT EXISTS conversation_jobs_due
+    ON conversation_jobs (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS conversation_jobs_version
+    ON conversation_jobs (session_id, version_id);
 """
 
 _init_lock = threading.Lock()
@@ -570,3 +629,319 @@ def recent_events(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
 
 def content_digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+# ---------------------------------------------------------------- 对话记忆
+#
+# 与文件任务同一套口径：一个会话版本对应一条当前任务，执行前先记 attempts，
+# 只有用户主动重试才新增一轮；失败信息写在 conversation_jobs.last_error 里。
+# 摘要缓存按 (session_id, source_revision, schema_version) 存，与会话当前版本解耦：
+# 会话更新后旧摘要仍在，但引用时必须带上它覆盖的版本。
+
+def get_conversation(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversations WHERE session_id=?", (session_id,)).fetchone())
+
+
+def all_conversations(conn: sqlite3.Connection) -> list[dict]:
+    return [dict(row) for row in conn.execute("SELECT * FROM conversations ORDER BY session_id")]
+
+
+def conversation_revision(conn: sqlite3.Connection, session_id: str) -> str | None:
+    row = conn.execute("SELECT active_revision FROM conversations WHERE session_id=?",
+                       (session_id,)).fetchone()
+    return row["active_revision"] if row is not None else None
+
+
+def version_by_revision(conn: sqlite3.Connection, session_id: str, revision: str) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversation_versions WHERE session_id=? AND revision=?",
+                             (session_id, revision)).fetchone())
+
+
+def get_conversation_version(conn: sqlite3.Connection, version_id: int) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversation_versions WHERE id=?", (version_id,)).fetchone())
+
+
+def latest_conversation_version(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversation_versions WHERE session_id=?"
+                             " ORDER BY id DESC LIMIT 1", (session_id,)).fetchone())
+
+
+def active_conversation_version(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    return _row(conn.execute(
+        "SELECT v.* FROM conversation_versions v JOIN conversations c"
+        " ON c.session_id=v.session_id AND c.active_revision=v.revision WHERE c.session_id=?",
+        (session_id,)).fetchone())
+
+
+def upsert_conversation(conn: sqlite3.Connection, *, session_id: str, title: str, turn_count: int,
+                        created_at: str, updated_at: str) -> None:
+    """登记/刷新会话元信息；不碰 active_revision（切换只由 activate_conversation_version 做）。"""
+    conn.execute(
+        "INSERT INTO conversations (session_id, title, turn_count, created_at, updated_at)"
+        " VALUES (?,?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET"
+        " title=excluded.title, turn_count=excluded.turn_count, updated_at=excluded.updated_at",
+        (session_id, title, turn_count, created_at or now_text(), updated_at or now_text()))
+
+
+def ensure_conversation_version(conn: sqlite3.Connection, session_id: str, revision: str,
+                                turn_count: int, title: str) -> tuple[dict, bool]:
+    """取得该会话版本记录；同一 revision 只登记一次，重跑不会新增版本。"""
+    stamp = now_text()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = version_by_revision(conn, session_id, revision)
+        if existing is not None:
+            conn.commit()
+            return existing, False
+        conn.execute(
+            "INSERT INTO conversation_versions (session_id, revision, turn_count, title, status, created_at)"
+            " VALUES (?,?,?,?,'stored',?)", (session_id, revision, turn_count, title, stamp))
+        conn.commit()
+        return version_by_revision(conn, session_id, revision), True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def set_conversation_version_status(conn: sqlite3.Connection, version_id: int, status: str,
+                                    error: str | None = None, chunk_count: int | None = None,
+                                    max_tokens: int | None = None) -> None:
+    indexed_at = now_text() if status == "indexed" else None
+    conn.execute(
+        "UPDATE conversation_versions SET status=?, error=?,"
+        " chunk_count=COALESCE(?, chunk_count), max_tokens=COALESCE(?, max_tokens),"
+        " indexed_at=COALESCE(?, indexed_at) WHERE id=?",
+        (status, error, chunk_count, max_tokens, indexed_at, version_id))
+
+
+def activate_conversation_version(conn: sqlite3.Connection, version_id: int) -> tuple[bool, int | None]:
+    """把该会话版本设为有效版本；只前进不后退（与文件版本一致）。
+
+    返回 (是否切换, 被替换的版本 id)。被替换的版本仍在库里，向量删除由调用方负责。
+    """
+    version = get_conversation_version(conn, version_id)
+    if version is None:
+        raise KeyError(f"会话版本不存在：{version_id}")
+    session_id = version["session_id"]
+    current = conversation_revision(conn, session_id)
+    set_conversation_version_status(conn, version_id, "indexed")
+    if current == version["revision"]:
+        return True, None
+    if current:
+        old = version_by_revision(conn, session_id, current)
+        if old is not None and old["id"] > version_id:
+            return False, None
+        conn.execute("UPDATE conversation_versions SET status='superseded', error=NULL WHERE id=?",
+                     (old["id"],))
+    else:
+        old = None
+    conn.execute("UPDATE conversations SET active_revision=?, updated_at=? WHERE session_id=?",
+                 (version["revision"], now_text(), session_id))
+    return True, (old["id"] if old is not None else None)
+
+
+# ---------------------------------------------------------------- 对话索引任务
+
+def current_conversation_job(conn: sqlite3.Connection, session_id: str, version_id: int) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversation_jobs WHERE session_id=? AND version_id=?"
+                             " ORDER BY round DESC LIMIT 1", (session_id, version_id)).fetchone())
+
+
+def get_conversation_job(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    return _row(conn.execute("SELECT * FROM conversation_jobs WHERE job_id=?", (job_id,)).fetchone())
+
+
+def ensure_conversation_job(conn: sqlite3.Connection, session_id: str, version_id: int) -> tuple[dict, bool]:
+    """取得该会话版本当前这一轮任务；已索引或已失败的任务不会因此重跑。"""
+    stamp = now_text()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = current_conversation_job(conn, session_id, version_id)
+        if existing is not None:
+            conn.commit()
+            return existing, False
+        job = {"job_id": "cjob_" + uuid.uuid4().hex[:12], "session_id": session_id,
+               "version_id": version_id, "kind": "conversation", "status": "queued", "stage": None,
+               "attempts": 0, "max_attempts": JOB_MAX_ATTEMPTS, "round": 1,
+               "next_attempt_at": time.time(), "last_error": None, "created_at": stamp,
+               "updated_at": stamp}
+        conn.execute(
+            "INSERT INTO conversation_jobs (job_id, session_id, version_id, kind, status, stage,"
+            " attempts, max_attempts, round, next_attempt_at, last_error, created_at, updated_at)"
+            " VALUES (:job_id,:session_id,:version_id,:kind,:status,:stage,:attempts,:max_attempts,"
+            " :round,:next_attempt_at,:last_error,:created_at,:updated_at)", job)
+        conn.commit()
+        return job, True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def claim_conversation_job(conn: sqlite3.Connection, now: float) -> dict | None:
+    """取出一个到期的对话索引任务并把尝试次数 +1 落盘（先记账再执行）。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM conversation_jobs WHERE status IN ('queued','retry_wait') AND"
+            " COALESCE(next_attempt_at,0)<=? ORDER BY next_attempt_at, created_at LIMIT 1",
+            (now,)).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute("UPDATE conversation_jobs SET status='processing', attempts=attempts+1,"
+                     " updated_at=? WHERE job_id=?", (now_text(), row["job_id"]))
+        job = get_conversation_job(conn, row["job_id"])
+        conn.commit()
+        return job
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def conversation_next_due_at(conn: sqlite3.Connection) -> float | None:
+    row = conn.execute("SELECT MIN(next_attempt_at) AS due FROM conversation_jobs"
+                       " WHERE status IN ('queued','retry_wait')").fetchone()
+    return row["due"] if row is not None and row["due"] is not None else None
+
+
+def set_conversation_job_stage(conn: sqlite3.Connection, job_id: str, stage: str) -> None:
+    conn.execute("UPDATE conversation_jobs SET stage=?, updated_at=? WHERE job_id=?",
+                 (stage, now_text(), job_id))
+
+
+def finish_conversation_job(conn: sqlite3.Connection, job_id: str, *, ok: bool,
+                            error: str | None = None, permanent: bool = False) -> dict:
+    """收尾一次对话索引尝试；口径与 finish_job 一致（5 秒、30 秒两次自动重试）。"""
+    stamp = time.time()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = get_conversation_job(conn, job_id)
+        if job is None:
+            raise KeyError(f"对话索引任务不存在：{job_id}")
+        version = get_conversation_version(conn, job["version_id"])
+        title = (version or {}).get("title") or job["session_id"]
+        if ok:
+            switched, superseded = activate_conversation_version(conn, job["version_id"])
+            conn.execute("UPDATE conversation_jobs SET status='indexed', stage=?, last_error=NULL,"
+                         " updated_at=? WHERE job_id=?", ("activate", now_text(), job_id))
+            if switched:
+                append_event(conn, kind="conversation_indexed", doc_id=None, version_id=None,
+                             job_id=job_id, file_name=title,
+                             message=f"会话「{title}」已加入对话记忆",
+                             detail=json.dumps({"session_id": job["session_id"],
+                                                "revision": (version or {}).get("revision")}))
+            result = {"status": "indexed", "switched": switched, "superseded": superseded}
+        else:
+            attempts = job["attempts"]
+            if permanent or attempts >= job["max_attempts"]:
+                conn.execute("UPDATE conversation_jobs SET status='failed', stage=?, last_error=?,"
+                             " updated_at=? WHERE job_id=?", (job["stage"], error, now_text(), job_id))
+                conn.execute("UPDATE conversation_versions SET status='failed', error=? WHERE id=?",
+                             (error, job["version_id"]))
+                append_event(conn, kind="conversation_failed", doc_id=None, version_id=None,
+                             job_id=job_id, file_name=title,
+                             message=f"会话「{title}」加入对话记忆失败，已停止自动重试",
+                             detail=error)
+                result = {"status": "failed"}
+            else:
+                delay = RETRY_DELAYS[min(attempts - 1, len(RETRY_DELAYS) - 1)]
+                conn.execute("UPDATE conversation_jobs SET status='retry_wait', stage=?, last_error=?,"
+                             " next_attempt_at=?, updated_at=? WHERE job_id=?",
+                             (job["stage"], error, stamp + delay, now_text(), job_id))
+                result = {"status": "retry_wait", "delay": delay}
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def recover_interrupted_conversations(conn: sqlite3.Connection, now: float) -> int:
+    """服务启动时接管上次留下的 processing 对话任务；那一次尝试已经记在账上。"""
+    rows = conn.execute("SELECT job_id, attempts, max_attempts FROM conversation_jobs"
+                        " WHERE status='processing'").fetchall()
+    for row in rows:
+        if row["attempts"] >= row["max_attempts"]:
+            finish_conversation_job(conn, row["job_id"], ok=False,
+                                    error="服务在处理该任务时中断，尝试次数已用尽", permanent=True)
+        else:
+            conn.execute("UPDATE conversation_jobs SET status='retry_wait', next_attempt_at=?,"
+                         " updated_at=? WHERE job_id=?", (now, now_text(), row["job_id"]))
+    return len(rows)
+
+
+def retry_conversation_job(conn: sqlite3.Connection, job_id: str) -> dict:
+    """用户主动重试（/retry）：新建一轮有上限的尝试，并把版本状态退回待处理。"""
+    stamp = now_text()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = get_conversation_job(conn, job_id)
+        if job is None:
+            raise KeyError(f"任务不存在：{job_id}")
+        current = current_conversation_job(conn, job["session_id"], job["version_id"])
+        if current["job_id"] != job_id:
+            raise ValueError(f"该任务已被新一轮重试 {current['job_id']} 替代，请重试最新那一轮")
+        if job["status"] in ("queued", "processing", "retry_wait"):
+            raise ValueError("该任务仍在排队或执行中，不能重复提交重试")
+        if job["status"] == "indexed":
+            raise ValueError("该会话版本已经建立索引，无需重试")
+        fresh = {"job_id": "cjob_" + uuid.uuid4().hex[:12], "session_id": job["session_id"],
+                 "version_id": job["version_id"], "kind": "conversation", "status": "queued",
+                 "stage": None, "attempts": 0, "max_attempts": JOB_MAX_ATTEMPTS,
+                 "round": current["round"] + 1, "next_attempt_at": time.time(), "last_error": None,
+                 "created_at": stamp, "updated_at": stamp}
+        conn.execute(
+            "INSERT INTO conversation_jobs (job_id, session_id, version_id, kind, status, stage,"
+            " attempts, max_attempts, round, next_attempt_at, last_error, created_at, updated_at)"
+            " VALUES (:job_id,:session_id,:version_id,:kind,:status,:stage,:attempts,:max_attempts,"
+            " :round,:next_attempt_at,:last_error,:created_at,:updated_at)", fresh)
+        conn.execute("UPDATE conversation_versions SET status='stored', error=NULL WHERE id=?",
+                     (job["version_id"],))
+        conn.commit()
+        return fresh
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def conversation_job_snapshot(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    """当前未成功/进行中的对话索引任务，供 /memory 显示失败原因。
+
+    每个会话版本只报"当前这一轮"（round 最大）的任务：被新一轮重试替代的旧记录
+    仍留在库里备查，但不再当成待办或失败展示，否则用户会看到一条永远消不掉的失败。
+    """
+    rows = conn.execute(
+        "SELECT j.job_id, j.session_id, j.status, j.attempts, j.max_attempts, j.round, j.last_error,"
+        " v.id AS version_id, v.status AS version_status, v.turn_count"
+        " FROM conversation_jobs j JOIN conversation_versions v ON v.id=j.version_id"
+        " WHERE j.status IN ('failed','queued','processing','retry_wait')"
+        "   AND j.round=(SELECT MAX(j2.round) FROM conversation_jobs j2"
+        "                WHERE j2.session_id=j.session_id AND j2.version_id=j.version_id)"
+        " ORDER BY j.updated_at DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def known_conversation_revisions(conn: sqlite3.Connection) -> set[str]:
+    """所有已登记的会话版本指纹：Chroma 里不在这份清单中的向量就是残留。"""
+    rows = conn.execute("SELECT session_id, revision FROM conversation_versions")
+    return {f"{row['session_id']}@{row['revision']}" for row in rows}
+
+
+# ---------------------------------------------------------------- 摘要缓存
+
+def get_summary_record(conn: sqlite3.Connection, session_id: str, source_revision: str,
+                       schema_version: int) -> dict | None:
+    return _row(conn.execute(
+        "SELECT * FROM conversation_summaries WHERE session_id=? AND source_revision=?"
+        " AND summary_schema_version=?", (session_id, source_revision, schema_version)).fetchone())
+
+
+def put_summary_record(conn: sqlite3.Connection, *, session_id: str, source_revision: str,
+                       schema_version: int, summary_json: str, generated_at: str) -> None:
+    """写入/替换摘要缓存；同一个 (会话, 版本, 结构版本) 只保留一条。"""
+    conn.execute(
+        "INSERT INTO conversation_summaries (session_id, source_revision, summary_schema_version,"
+        " summary_json, generated_at) VALUES (?,?,?,?,?)"
+        " ON CONFLICT (session_id, source_revision, summary_schema_version) DO UPDATE SET"
+        " summary_json=excluded.summary_json, generated_at=excluded.generated_at",
+        (session_id, source_revision, schema_version, summary_json, generated_at))

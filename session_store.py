@@ -1,11 +1,16 @@
 """CLI 的本地会话存储：sessions/state.json 记录活动会话，sessions/<id>.json 保存单个会话。
 
-只用标准库和 JSON，不引入数据库。位置由本文件位置决定，跟启动目录无关。
+只用标准库和 JSON，不引入数据库。位置默认由本文件位置决定，跟启动目录无关；也可以用
+环境变量 GAGENT_SESSIONS_DIR 指向别处（测试、隔离实例用，子进程从环境继承）。
 写入走同目录临时文件再替换，中途退出不破坏原文件；读不出来的会话文件按错误上报，
 不会被当成空会话覆盖。跨轮历史只保存每轮的 user 和 final_answer；标题允许为空，
 由调用方在首轮问答后填成用户的第一个问题。
+
+文件末尾提供对话索引需要的版本信息：轮次标识 turn_id(session_id:轮次序号)、
+每轮原文和整份会话的内容指纹 revision_of()。指纹只由正文决定，标题变化不重建向量。
 """
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +19,13 @@ import tempfile
 import uuid
 
 
-SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+SESSIONS_DIR = Path(os.environ.get("GAGENT_SESSIONS_DIR")
+                    or Path(__file__).resolve().parent / "sessions")
+
+
+def default_sessions_dir() -> Path:
+    """当前生效的会话目录；运行时读取模块属性，测试替换 SESSIONS_DIR 后立刻生效。"""
+    return Path(SESSIONS_DIR)
 STATE_FILENAME = "state.json"
 ACTIVE_KEY = "active_session"
 ID_CHARS = 6
@@ -128,6 +139,46 @@ class SessionStore:
         metas.sort(key=lambda item: (item["updated_at"], item["created_at"]), reverse=True)
         return metas, broken
 
+    def scan_ids(self) -> tuple[list[str], list[str]]:
+        """只列会话文件名，不做内容校验：返回 (按文件名排序的 id, 读不出来的文件名)。
+
+        后台索引需要它来做到"每个会话文件都有交代"——scan() 会把读不出来的文件直接从
+        列表里剔掉，那样坏文件既不会被索引，也不会出现在提示里。
+        """
+        if not self.root.is_dir():
+            return [], []
+        ids, broken = [], []
+        for path in sorted(self.root.glob("*.json")):
+            if path.name == STATE_FILENAME or not path.is_file():
+                continue
+            if ID_RE.match(path.stem):
+                ids.append(path.stem)
+            else:
+                broken.append(path.name)
+        return ids, broken
+
+    def read_meta(self, session_id: str) -> dict:
+        """只读会话元信息、不做 turns 的结构校验，也不会因为某一轮格式不对就整份失败。
+
+        后台索引用它区分"文件不存在"和"文件读不出来"：两者都不该被当成空会话处理，
+        但提示和后续处理不同。
+        """
+        path = self.path_of(session_id)
+        if not path.is_file():
+            raise SessionNotFound(str(path))
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SessionCorrupted(f"{path.name} 读取失败：{type(exc).__name__}") from exc
+        if not isinstance(raw, dict):
+            raise SessionCorrupted(f"{path.name} 内容不是对象")
+        if not _text(raw.get("id")) or _text(raw.get("id")) != session_id:
+            raise SessionCorrupted(f"{path.name} 的 id 与文件名不一致")
+        turns = raw.get("turns", [])
+        if not isinstance(turns, list):
+            raise SessionCorrupted(f"{path.name} 的 turns 不是列表")
+        return {"id": session_id, "title": clean_title(raw.get("title")), "turns": len(turns)}
+
     def _validate(self, raw, expected_id: str | None, source: str) -> dict:
         if not isinstance(raw, dict):
             raise SessionCorrupted(f"{source} 内容不是对象")
@@ -175,3 +226,53 @@ def clean_title(title) -> str:
     """标题压成单行并限长；空标题返回空串，由调用方决定默认名称。"""
     collapsed = " ".join(_text(title).replace("\t", " ").split())
     return collapsed[:TITLE_MAX_CHARS].strip()
+
+
+# ---------------------------------------------------------------- 对话索引用的版本信息
+#
+# 会话是追加式记录：每轮的正文只有 user 和 final_answer。索引与摘要都按"版本"记账，
+# 版本用整份 session 的原文内容指纹表示；指纹变了就说明旧向量不再代表当前内容，
+# 必须重建而不是继续把旧向量当作有效记录。
+
+def turn_id(session_id: str, turn_index: int) -> str:
+    """第 turn_index（从 0 开始）轮的稳定标识，形如 abc123:18。"""
+    return f"{_text(session_id)}:{int(turn_index)}"
+
+
+def turn_text(turn: dict) -> str:
+    """一轮里真正属于对话原文的两段；系统提示词、工具过程都不在这里。"""
+    if not isinstance(turn, dict):
+        return ""
+    return f"{_text(turn.get('user')).strip()}\n{_text(turn.get('final_answer')).strip()}".strip()
+
+
+def revision_of(session: dict) -> str:
+    """整份会话原文的内容指纹：轮序、user、final_answer 任一变化都会改变它。
+
+    只依赖原文，标题变化不改变版本（标题变化不需要重建向量）。
+    """
+    turns = session.get("turns") or []
+    payload = json.dumps([[_text(turn.get("user")), _text(turn.get("final_answer"))]
+                          for turn in turns if isinstance(turn, dict)],
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def session_meta(session: dict) -> dict:
+    """索引和摘要需要的会话元信息（不含正文）。"""
+    return {"session_id": _text(session.get("id")), "title": clean_title(session.get("title")),
+            "created_at": _text(session.get("created_at")),
+            "updated_at": _text(session.get("updated_at")),
+            "turn_count": len(session.get("turns") or []),
+            "revision": revision_of(session)}
+
+
+def indexable_sessions(store: "SessionStore") -> tuple[list[dict], list[str]]:
+    """扫描全部会话原文，供后台建立/校对对话索引；返回 (会话, 读不出来的文件名)。"""
+    sessions, broken = [], []
+    for meta in store.scan()[0]:
+        try:
+            sessions.append(store.read(meta["id"]))
+        except (OSError, SessionCorrupted, SessionNotFound) as exc:
+            broken.append(f"{meta['id']}（{type(exc).__name__}: {exc}）")
+    return sessions, broken

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -24,12 +25,15 @@ SERVICE_MODULE = "rag.service"
 READ_TIMEOUT = 120.0
 SEARCH_TIMEOUT = float(os.environ.get("GAGENT_RAG_SEARCH_TIMEOUT", "5"))
 EVENT_TIMEOUT = float(os.environ.get("GAGENT_RAG_EVENT_TIMEOUT", "5"))
+# 跨会话回忆可能要现算摘要，比普通检索慢得多，不能沿用 5 秒。
+RECALL_TIMEOUT = float(os.environ.get("GAGENT_RAG_RECALL_TIMEOUT", "90"))
 START_TIMEOUT = float(os.environ.get("GAGENT_RAG_START_TIMEOUT", "60"))
 CACHE_SECONDS = 5.0
 LOCK_STALE_SECONDS = 120.0
 
 # 服务侧的业务错误不该反复重启服务。
-_NO_RESTART = {"bad_request", "not_found", "not_retryable", "search_error", "disabled"}
+_NO_RESTART = {"bad_request", "not_found", "not_retryable", "search_error", "disabled",
+               "sessions_mismatch"}
 
 _cache = {"base": None, "checked": 0.0}
 _cache_lock = threading.Lock()
@@ -50,6 +54,51 @@ class ServiceUnavailable(ServiceError):
 
 def _base(port) -> str:
     return f"http://127.0.0.1:{port}"
+
+
+def _sessions_dir_text() -> str:
+    """本次运行实际使用的会话目录（CLI 的 --sessions-dir 由 cli._use_sessions_dir 落在这里）。
+
+    运行时读取模块属性，不缓存：同一进程里换目录（测试、隔离实例）必须立刻生效。
+    """
+    try:
+        import session_store
+        return str(session_store.SESSIONS_DIR)
+    except Exception:  # pragma: no cover - 正常情况下 session_store 一定可用
+        return ""
+
+
+def _canonical_dir(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _sessions_dir_matches(*sources: dict) -> bool:
+    """服务上报的会话目录是否就是本次运行要用的那一个。
+
+    旧版服务没有这个字段，无法确认时必须当成不一致（宁可拒绝，也不能把 CLI 的
+    自定义会话目录交给一个正在索引默认 sessions/ 的旧服务）。
+    """
+    wanted = _canonical_dir(_sessions_dir_text())
+    if not wanted:  # 取不到自己的目录时退回旧行为，不误伤
+        return True
+    return any(_canonical_dir((source or {}).get("sessions_dir")) == wanted for source in sources)
+
+
+def _sessions_mismatch_error(info: dict) -> "ServiceUnavailable":
+    """目录不一致的明确错误：说明双方目录、为什么不能复用、以及怎么恢复。"""
+    health = info.get("health") or {}
+    reported = str(health.get("sessions_dir") or info.get("sessions_dir") or "").strip()
+    theirs = reported or "（旧版服务，未上报会话目录）"
+    pid = info.get("pid") or "未知"
+    return ServiceUnavailable(
+        f"本机已有文件服务在运行（pid {pid}），但它的会话目录是 {theirs}，"
+        f"与本次运行的 {_sessions_dir_text()} 不一致：对话记忆不能跨目录混用。"
+        f"本次不复用该服务，也不会另起一个（两个进程同时写同一份数据会互相破坏）。"
+        f"请先停止旧服务（Windows：taskkill /F /PID {pid}）或改用相同的 --sessions-dir。",
+        "sessions_mismatch")
 
 
 def service_info() -> dict | None:
@@ -76,12 +125,38 @@ def probe(base: str, timeout: float = 1.5) -> dict | None:
 
 
 def running() -> dict | None:
-    """当前项目可用的服务实例；返回健康信息，不可用返回 None。"""
+    """当前项目可用的服务实例；不可用或会话目录不是本次要用的，返回 None。"""
     info = service_info()
     if info is None or not info.get("port"):
         return None
     health = probe(_base(info["port"]))
-    return None if health is None else {**info, "health": health}
+    if health is None:
+        return None
+    if not _sessions_dir_matches(info, health):
+        return None  # 有服务但用的不是本次的会话目录：不复用，也不许再起一个
+    return {**info, "health": health}
+
+
+def foreign_service() -> dict | None:
+    """当前项目有服务在跑，但会话目录与本次运行不一致；没有就返回 None。
+
+    这是"先按默认目录起过一次服务、再用 --sessions-dir X 启动"的正常场景：
+    服务在 CLI 退出后继续运行，必须在连接前就把它认出来。
+    """
+    info = service_info()
+    if info is None or not info.get("port"):
+        return None
+    health = probe(_base(info["port"]))
+    if health is None or _sessions_dir_matches(info, health):
+        return None
+    return {**info, "health": health}
+
+
+def _refuse_foreign_service() -> None:
+    """有服务在用别的会话目录：既不能复用，也不能再起一个（会同时写同一份数据）。"""
+    foreign = foreign_service()
+    if foreign is not None:
+        raise _sessions_mismatch_error(foreign)
 
 
 def _invalidate() -> None:
@@ -110,6 +185,9 @@ def endpoint(start: bool = True) -> str:
     if info is None and start:
         info = _ensure_started()
     if info is None:
+        foreign = foreign_service()
+        if foreign is not None:
+            raise _sessions_mismatch_error(foreign)
         raise ServiceUnavailable(
             "文件服务不可用" if not start else
             f"文件服务未能启动或响应；日志：{rag_state.logs_dir() / 'service.log'}", "not_running")
@@ -120,17 +198,23 @@ def endpoint(start: bool = True) -> str:
 
 
 def _ensure_started() -> dict | None:
-    """确保有且只有一个服务实例：抢启动锁，没抢到就等对方起来。"""
+    """确保有且只有一个服务实例：抢启动锁，没抢到就等对方起来。
+
+    已经有服务在跑、但会话目录不是本次要用的，直接拒绝：复用会把 CLI 的对话记忆
+    写进另一个目录，另起一个又会让两个进程同时写同一份资料库。
+    """
     deadline = time.monotonic() + START_TIMEOUT
     with _start_lock:
         info = running()
         if info is not None:
             return info
+        _refuse_foreign_service()
         holder = _acquire_lock()
         if holder:
             try:
                 info = running()
                 if info is None:
+                    _refuse_foreign_service()
                     _spawn()
                 else:
                     return info
@@ -175,12 +259,17 @@ def _wait_until_ready(deadline: float) -> dict | None:
         info = running()
         if info is not None:
             return info
+        _refuse_foreign_service()  # 等的是别人的服务且目录不对：立刻说清楚，别干等
         time.sleep(0.25)
     return None
 
 
 def _spawn() -> subprocess.Popen:
-    """在后台启动服务进程：不弹控制台窗口，CLI 退出也不影响它继续处理任务。"""
+    """在后台启动服务进程：不弹控制台窗口，CLI 退出也不影响它继续处理任务。
+
+    显式带上 GAGENT_SESSIONS_DIR：CLI 可能用 --sessions-dir 或隔离的会话目录，
+    服务进程是另一个进程，只有环境变量传得过去（否则它会去索引默认的 sessions/）。
+    """
     rag_state.ensure_dirs()
     handle = (rag_state.logs_dir() / "service.log").open("a", encoding="utf-8")
     flags = 0
@@ -188,10 +277,15 @@ def _spawn() -> subprocess.Popen:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     environment = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     try:
+        import session_store
+        environment["GAGENT_SESSIONS_DIR"] = str(session_store.SESSIONS_DIR)
+    except Exception:
+        pass
+    try:
         return subprocess.Popen([sys.executable, "-X", "utf8", "-m", SERVICE_MODULE, "--serve"],
                                 stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
                                 cwd=str(ROOT), close_fds=True, creationflags=flags,
-                                start_new_session=os.name != "nt")
+                                start_new_session=os.name != "nt", env=environment)
     finally:
         handle.close()  # 子进程已持有该 fd，父进程这边要关掉，否则日志文件一直开着
 
@@ -322,3 +416,85 @@ def job(job_id: str) -> dict:
 
 def retry_job(job_id: str) -> dict:
     return _request("POST", f"/v1/jobs/{job_id}/retry", timeout=EVENT_TIMEOUT)
+
+
+# ---------------------------------------------------------------- 对话记忆（跨会话回忆）
+
+def _conversation_path(session_id) -> str:
+    return f"/v1/conversations/{quote(str(session_id), safe='')}"
+
+
+def conversations_sync(session_id: str | None = None, *, all: bool = False, start: bool = True) -> dict:
+    """让服务把会话的问答轮次补进对话索引。
+
+    all=True 同步全部会话（首次启用时把已有 session 全部入队），此时不带 session_id；
+    否则只同步指定的一个会话。异常照常抛出，由后台调用方兜住，不在这里吞掉。
+    """
+    payload = {"session_id": None if all else session_id, "all": bool(all)}
+    return _request("POST", "/v1/conversations/sync", payload=payload, timeout=READ_TIMEOUT, start=start)
+
+
+def conversations_search(query: str, *, exclude_sessions: list[str] | None = None,
+                         top_chunks: int = 20, max_sessions: int = 3, start: bool = True) -> dict:
+    """按语义检索历史对话片段（含候选会话）。
+
+    与 search 一样不阻塞问答：空问题不请求服务，服务故障降级成 status=error，
+    由工具层决定怎么如实回答。
+    """
+    text = (query or "").strip()
+    if not text:
+        return {"status": "invalid", "reason": "空问题", "query": "", "hits": [], "candidates": []}
+    payload = {"query": text, "exclude_sessions": list(exclude_sessions or []),
+               "top_chunks": int(top_chunks), "max_sessions": int(max_sessions)}
+    try:
+        return _request("POST", "/v1/conversations/search", payload=payload, timeout=READ_TIMEOUT, start=start)
+    except Exception as exc:
+        return {"status": "error", "reason": f"{type(exc).__name__}: {exc}",
+                "query": text, "hits": [], "candidates": []}
+
+
+def conversation_history(session_id: str, *, start: bool = True) -> dict:
+    """一个会话的完整问答、索引状态与摘要记录；管理、排错用。"""
+    return _request("GET", _conversation_path(session_id), timeout=READ_TIMEOUT, start=start)
+
+
+def conversation_summary(session_id: str, *, revision: str | None = None, start: bool = True) -> dict:
+    """取会话的摘要记录；revision 用来确认摘要对应的是哪个源版本。"""
+    params = {"revision": revision} if revision else None
+    return _request("GET", _conversation_path(session_id) + "/summary", params=params,
+                    timeout=READ_TIMEOUT, start=start)
+
+
+def put_conversation_summary(session_id, *, source_revision, summary_schema_version, summary_json,
+                             generated_at, start=True) -> dict:
+    """写回摘要：调用方负责把生成好的摘要按源版本落库，版本不匹配由服务拒绝。"""
+    payload = {"source_revision": source_revision, "summary_schema_version": summary_schema_version,
+               "summary_json": summary_json, "generated_at": generated_at}
+    return _request("PUT", _conversation_path(session_id) + "/summary", payload=payload,
+                    timeout=READ_TIMEOUT, start=start)
+
+
+def recall_conversation(query: str, *, session_id: str | None = None, exclude_session: str | None = None,
+                        include_summary: bool = True, api_settings: dict | None = None,
+                        start: bool = True) -> dict:
+    """跨会话回忆：检索历史对话，并让服务按需整理成摘要回答。
+
+    任何故障都不阻塞当前问答：空问题返回 status=invalid，检索失败或服务不可用返回
+    status=error，由工具层如实回答“没找到/服务不可用”。
+    api_settings 只在请求体里发给本机服务，不写日志也不落盘。
+    """
+    text = (query or "").strip()
+    if not text:
+        return {"status": "invalid", "reason": "空问题", "evidence": []}
+    try:
+        if api_settings is None:
+            from api_setup import active_api_settings
+            api_settings = active_api_settings()
+        payload = {"query": text, "session_id": session_id, "exclude_session": exclude_session,
+                   "include_summary": bool(include_summary),
+                   "api_settings": dict(api_settings) if isinstance(api_settings, dict) else {}}
+        # 现算摘要可能很久，只试一次：重试只会让用户多等一轮超时。
+        return _request("POST", "/v1/conversations/recall", payload=payload,
+                        timeout=RECALL_TIMEOUT, start=start, attempts=1)
+    except Exception as exc:
+        return {"status": "error", "reason": f"{type(exc).__name__}: {exc}", "evidence": []}

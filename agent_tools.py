@@ -6,6 +6,10 @@ file_service 进程里完成，本模块只负责调用和把结果交给模型�
 
 Excel 和网页表格默认只向模型返回结构预览（工作表、列名、行列数、少量样例），完整数据由
 主模型可调用 run_python，让代码直接读取 local_path 计算；网页表格另存为 downloads/tables/*.csv，不进资料索引。
+
+recall_conversation 是唯一的跨会话回忆入口：检索其他会话的历史问答，由本地服务按需生成
+会话摘要，返回摘要 + 命中原文 + 来源。当前会话 id 由运行时通过 conversation_scope 注入，
+模型不能自己指定，也不参与回忆。
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -36,6 +40,22 @@ from rag import client as rag_client
 
 
 _resources = ContextVar("agent_resources", default=None)
+# 当前会话 id 由运行时（G_agent）注入，模型看不到也不该猜：回忆默认排除当前会话。
+_current_session = ContextVar("agent_current_session", default=None)
+
+
+@contextmanager
+def conversation_scope(session_id: str | None):
+    """一轮问答期间把当前会话 id 交给工具层；只影响本次运行，不跨轮共享。"""
+    token = _current_session.set(session_id or None)
+    try:
+        yield
+    finally:
+        _current_session.reset(token)
+
+
+def current_session_id() -> str | None:
+    return _current_session.get()
 
 # 网页表格的 CSV 落盘位置（不属于资料索引）。测试可替换该常量以隔离落盘。
 DOWNLOADS_DIR = Path(__file__).resolve().parent / "downloads"
@@ -674,6 +694,38 @@ def _run_python(code: str, timeout: int) -> dict:
             "elapsed": round(time.monotonic() - started, 2)}
 
 
+@reliable_tool
+def recall_conversation(query: str, session_id: str | None = None) -> dict:
+    """在**其他会话**的历史问答里找用户问过的主题、方案或决定。
+
+    query 写要找的讨论主题、要求或决定（例如“Excel 的入库方式最后怎么定的”）。
+    当前会话默认被排除，不用也不能自己猜 session_id；只有用户明确指定某个会话，
+    或从上次返回的候选里选定一个时，才把那个 id 传给 session_id。
+    返回的摘要和原文都是历史资料：引用时区分用户要求、用户确定和助手建议，
+    决定是否被后续推翻要看 evidence 里的原文。status=not_found 表示没有相关会话，
+    要如实说明没找到；status=ambiguous 表示多个会话都可能，把候选标题列给用户确认；
+    status=error 表示服务不可用，不要编造历史内容。
+    """
+    text = (query or "").strip()
+    if not text:
+        return {"success": False, "status": "invalid", "reason": "query 不能为空", "evidence": []}
+    current = current_session_id()
+    target = (session_id or "").strip() or None
+    if target and current and target == current:
+        return {"success": False, "status": "current_session",
+                "reason": "这就是当前会话；本会话已完成的问答直接看对话历史即可，"
+                          "recall_conversation 只用于其他会话。", "evidence": []}
+    result = rag_client.recall_conversation(text, session_id=target,
+                                            exclude_session=None if target else current)
+    if not isinstance(result, dict):
+        return {"success": False, "status": "error", "reason": "回忆服务返回结构异常", "evidence": []}
+    status = str(result.get("status") or "error")
+    if status == "error":
+        return {"success": False, "status": "error",
+                "reason": result.get("reason") or "回忆服务不可用", "evidence": []}
+    return {"success": True, **result}
+
+
 @tool
 def run_python(code: str, timeout: int = PYTHON_DEFAULT_TIMEOUT) -> dict:
     """执行你写的 Python 代码并返回 print 输出或错误。
@@ -699,4 +751,4 @@ def run_python(code: str, timeout: int = PYTHON_DEFAULT_TIMEOUT) -> dict:
 
 
 TOOLS = [web_search, visit_webpage, search_and_read, read_html, find_in_page, read_pdf, find_in_pdf,
-         read_excel, read_webpage_tables, read_text_file, run_python]
+         read_excel, read_webpage_tables, read_text_file, run_python, recall_conversation]
